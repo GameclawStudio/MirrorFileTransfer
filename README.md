@@ -1,5 +1,4 @@
-# FileTransfer
-### For Mirror!
+# FileTransfer for Mirror!
 This is a simple solution to send large files between the server and clients. I didn't want to host files and download them with HTTP requests when we already have a direct connection between clients. This plugin will let you send a large chunk of data directly to a client or server by utilising the connection setup already by the Mirror plugin so you dont need to pay for any additional server needs.
  
 ## Dependencies
