@@ -1,10 +1,11 @@
-# Mirror FileTransfer
-This is a rather simple solution that arouse from a need to send large files between the server and clients. I didn't want to host files and download them with HTTP requests when we already have a direct connection. This plugin will let you send a large chunk of data directly to a client or server by utilising the connection setup already by the Mirror plugin.
+# FileTransfer
+###For Mirror!
+This is a simple solution to send large files between the server and clients. I didn't want to host files and download them with HTTP requests when we already have a direct connection between clients. This plugin will let you send a large chunk of data directly to a client or server by utilising the connection setup already by the Mirror plugin so you dont need to pay for any additional server needs.
  
 ## Dependencies
-If you're using Mirror for Unity as your Networking solution this plugin should work out of the box. There are no dependencies on anything except for Mirror itself.
+If you're using Mirror for Unity as your Networking solution this plugin should work out of the box. There are no dependencies on anything except for Mirror itself. (And C# .NET of course)
 
-## How to use it
+# How to use it
 The namespace is `Gameclaw` and the main class is `FileTransfer`. Everything has comments so should be relatively easy to decipher. Nonetheless here is a simple example and explanation to get you started. First of all, you can setup some delegates that will get invoked whenever a file transfer begins, ends, fails. They are the following:
 ```csharp
         public static Action<FileTransferProgress> OnBeginRecievingFile;
