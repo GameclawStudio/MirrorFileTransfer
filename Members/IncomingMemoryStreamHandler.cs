@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
+using Mirror;
 
 namespace Gameclaw {
     internal class IncomingMemoryStreamHandler {
@@ -14,6 +15,7 @@ namespace Gameclaw {
         public FileTransferProgress progressTracker = new FileTransferProgress();
         public MemoryStream stream = new MemoryStream();
         public Dictionary<int, byte[]> queuedChunks = new Dictionary<int, byte[]>();
+        public NetworkConnection connection_serverUseOnly;
 
         async void TimeoutCheck() {
             while (progressTracker.ProgressAction != ProgressAction.Finished) {

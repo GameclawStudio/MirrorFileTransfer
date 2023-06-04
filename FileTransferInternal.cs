@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Formatters.Binary;
@@ -7,15 +8,34 @@ using System.Security.Cryptography;
 using System.Threading.Tasks;
 using Mirror;
 using UnityEngine;
+using Debug = UnityEngine.Debug;
 
 namespace Gameclaw {
     internal static class FileTransferInternal {
+
+        const int BufferSize = 4096; // 4 KiB
+        const int MillisecondsBeforeYield = 16; // less then 1 frame of time at 60 FPS
+        const long MaxBytesPerSecond = 2097152; // 2 MiB
         
-#region Internal       
-        static Dictionary<string, Result> outgoingStreamsWaitingForConfirmation = new Dictionary<string, Result>();
-        static Dictionary<string, IncomingMemoryStreamHandler> incomingMemoryStreams = new Dictionary<string, IncomingMemoryStreamHandler>();
+        public static void Setup() {
+                NetworkServer.RegisterHandler<FileChunk>(ReceiveFileChunk);
+                NetworkServer.RegisterHandler<FileResult>(ReceiveFileResult);
+                NetworkClient.RegisterHandler<FileChunk>(ReceiveFileChunk);
+                NetworkClient.RegisterHandler<FileResult>(ReceiveFileResult);
+        }
+
+        public static void Shutdown() {
+                NetworkServer.UnregisterHandler<FileChunk>();
+                NetworkServer.UnregisterHandler<FileResult>();
+                NetworkClient.UnregisterHandler<FileChunk>();
+                NetworkClient.UnregisterHandler<FileResult>();
+        }
         
-        public static async void SendData(NetworkConnectionToClient conn, FileTransferProgress progressTracker, object data, bool toClient, string identifier, Action<Result> callback) {
+        public static Dictionary<string, OutgoingMemoryStreamToken> outgoingStreamsWaitingForConfirmation = new Dictionary<string, OutgoingMemoryStreamToken>();
+        public static Dictionary<string, IncomingMemoryStreamHandler> incomingMemoryStreams = new Dictionary<string, IncomingMemoryStreamHandler>();
+
+#region Internal
+        public static async void SendData(NetworkConnection connection, FileTransferProgress progressTracker, object data, string identifier, Action<Result> callback) {
             // setup result for callback
             Result result = new Result();
 
@@ -42,81 +62,20 @@ namespace Gameclaw {
                     goto Invoke;
                 }
 
-                // Get md5 to confirm the final result and identify chunks
-                string md5 = GenerateMD5(stream);
-                outgoingStreamsWaitingForConfirmation.Add(md5, Result.Waiting);
-
-                int chunkSize = 4096;
-                long totalRead = 0;
-                long streamLength = stream.Length;
-                int index = 0;
-
-                LogMessage($"Begun sending chunks (bytes in Stream: {streamLength})", LogType.Log);
-                progressTracker.ProgressAction = ProgressAction.Sending;
-
-                byte[] dataInBytes = new byte[chunkSize];
-                stream.Seek(0, SeekOrigin.Begin);
-                while (true) {
-                    index++;
-
-                    chunkSize = stream.Read(dataInBytes, 0, dataInBytes.Length);
-                    if (chunkSize > 0) {
-                        LogMessage($"Sending chunk: {index}", LogType.Verbose);
-                        if (toClient) {
-                            Target_SendStreamData(conn, dataInBytes, index, md5, identifier, streamLength, true, false);
-                        }
-                        else {
-                            Cmd_SendStreamData(conn, dataInBytes, index, md5, identifier, streamLength, true, false);
-                        }
-                        totalRead += dataInBytes.Length;
-                        progressTracker.Progress = totalRead / (float)streamLength;
-                    }
-                    else {
-                        progressTracker.Progress = 1f;
-                        LogMessage($"Sending final chunk notification: {index - 1}", LogType.Verbose);
-
-                        if (toClient) {
-                            Target_SendStreamData(conn, null, index - 1, md5, identifier, streamLength, true, true);
-                        }
-                        else {
-                            Cmd_SendStreamData(conn, null, index - 1, md5, identifier, streamLength, true, true);
-                        }
-                        break;
-                    }
+                string md5 = await SendStreamInChunks(connection, stream, progressTracker, identifier);
+                if (progressTracker.ProgressAction == ProgressAction.Finished) {
+                    // FAILURE already being sent
+                    result = Result.Failed;
+                    goto Invoke;
                 }
-                // inform progress status
-                progressTracker.ProgressAction = ProgressAction.WaitingForConfirmation;
-
-                // Wait time before timing out (in milliseconds)
-                int waitLimit = 10000;
-                int tickLength = 10;
-                int ticks = 0;
-
-                while (true) {
-                    if (outgoingStreamsWaitingForConfirmation.TryGetValue(md5, out Result callbackResult)) {
-                        if (callbackResult != Result.Waiting) {
-                            result = callbackResult;
-                            break;
-                        }
-                    }
-                    
-                    ticks++;
-
-                    if (ticks * tickLength > waitLimit) {
-                        outgoingStreamsWaitingForConfirmation.Remove(md5);
-                        LogMessage($"Failed to confirm result of transfer (Timed out)", LogType.Error);
-                        break;
-                    }
-                    
-                    await Task.Delay(tickLength);
-                }
+                result = await WaitForOutgoingStreamResult(md5);
             }
 
-            Invoke: ;
+            Invoke:
             progressTracker.ProgressAction = ProgressAction.Finished;
             callback?.Invoke(result);
-        }       
-        public static async void SendData(NetworkConnectionToClient conn, FileTransferProgress progressTracker, Stream stream, bool toClient, string identifier, Action<Result> callback) {
+        }
+        public static async void SendData(NetworkConnection connection, FileTransferProgress progressTracker, Stream stream, string identifier, Action<Result> callback) {
             // setup result for callback
             Result result = new Result();
 
@@ -126,16 +85,32 @@ namespace Gameclaw {
                 goto Invoke;
             }
 
+            string md5 = await SendStreamInChunks(connection, stream, progressTracker, identifier);
+            if (progressTracker.ProgressAction == ProgressAction.Finished) {
+                // FAILURE already being sent
+                result = Result.Failed;
+                goto Invoke;
+            }
+            result = await WaitForOutgoingStreamResult(md5);
+            
+            
+            Invoke:
+            progressTracker.ProgressAction = ProgressAction.Finished;
+            callback?.Invoke(result);
+        }
+        static async Task<string> SendStreamInChunks(NetworkConnection connection, Stream stream, FileTransferProgress progressTracker, string identifier) {
             using (stream) {
-                // inform progress status
-                progressTracker.ProgressAction = ProgressAction.Serializing;
 
                 // Get md5 to confirm the final result and identify chunks
-                string md5 = GenerateMD5(stream);
-                
-                outgoingStreamsWaitingForConfirmation.Add(md5, Result.Waiting);
+                string md5 = await GenerateMD5(stream);
+                if (outgoingStreamsWaitingForConfirmation.ContainsKey(md5)) {
+                    LogMessage($"Failed, the same file is already being sent", LogType.Error);
+                    progressTracker.ProgressAction = ProgressAction.Finished;
+                    return md5;
+                }
+                outgoingStreamsWaitingForConfirmation.Add(md5, new OutgoingMemoryStreamToken(Result.Waiting, connection));
 
-                int chunkSize = 4096;
+                int chunkSize = BufferSize;
                 long totalRead = 0;
                 long streamLength = stream.Length;
                 int index = 0;
@@ -143,105 +118,103 @@ namespace Gameclaw {
                 LogMessage($"Begun sending chunks (bytes in Stream: {streamLength})", LogType.Log);
                 progressTracker.ProgressAction = ProgressAction.Sending;
 
+                Stopwatch yieldCheck = new Stopwatch();
+                yieldCheck.Start();
+                int maxBytesPerSecondThrottleTime = (int)(1000 / (MaxBytesPerSecond / chunkSize));
+                
                 byte[] dataInBytes = new byte[chunkSize];
                 stream.Seek(0, SeekOrigin.Begin);
+                FileChunk chunk = new FileChunk();
+                chunk.fileSize = streamLength;
+                chunk.identifier = identifier;
+                chunk.md5 = md5;
+                chunk.serialized = false;
                 while (true) {
                     index++;
-
-                    chunkSize = await stream.ReadAsync(dataInBytes, 0, dataInBytes.Length);
+                    chunk.index = index;
+                    chunkSize = stream.Read(dataInBytes, 0, dataInBytes.Length);
                     if (chunkSize > 0) {
+                        Array.Resize(ref dataInBytes, chunkSize);
+                        chunk.data = dataInBytes;
+                        chunk.final = false;
                         LogMessage($"Sending chunk: {index}", LogType.Verbose);
-                        if (toClient) {
-                            Target_SendStreamData(conn, dataInBytes, index, md5, identifier, streamLength, false, false);
-                        }
-                        else {
-                            Cmd_SendStreamData(conn, dataInBytes, index, md5, identifier, streamLength, false, false);
-                        }
                         totalRead += dataInBytes.Length;
                         progressTracker.Progress = totalRead / (float)streamLength;
                     }
                     else {
+                        chunk.data = null;
+                        chunk.final = true;
                         progressTracker.Progress = 1f;
                         LogMessage($"Sending final chunk notification: {index - 1}", LogType.Verbose);
+                    }
+                    connection.Send(chunk);
+                    if (chunkSize <= 0) break;
 
-                        if (toClient) {
-                            Target_SendStreamData(conn, null, index - 1, md5, identifier, streamLength, false, true);
-                        }
-                        else {
-                            Cmd_SendStreamData(conn, null, index - 1, md5, identifier, streamLength, false, true);
-                        }
-                        break;
+                    await Task.Delay(maxBytesPerSecondThrottleTime);
+                    if (yieldCheck.ElapsedMilliseconds >= MillisecondsBeforeYield) {
+                        yieldCheck.Restart();
+                        await Task.Yield();
                     }
                 }
+                
+                yieldCheck.Stop();
+                
                 // inform progress status
                 progressTracker.ProgressAction = ProgressAction.WaitingForConfirmation;
 
-                // Wait time before timing out (in milliseconds)
-                int waitLimit = 10000;
-                int tickLength = 10;
-                int ticks = 0;
-
-                while (true) {
-                    await Task.Delay(tickLength);
-                    
-                    if (outgoingStreamsWaitingForConfirmation.TryGetValue(md5, out Result callbackResult)) {
-                        if (callbackResult != Result.Waiting) {
-                            result = callbackResult;
-                            break;
-                        }
-                    }
-                    
-                    ticks++;
-
-                    if (ticks * tickLength > waitLimit) {
-                        outgoingStreamsWaitingForConfirmation.Remove(md5);
-                        LogMessage($"Failed to confirm result of transfer (Timed out)", LogType.Error);
+                return md5;
+            }
+        }
+        static async Task<Result> WaitForOutgoingStreamResult(string md5) {
+            // Wait time before timing out (in milliseconds)
+            int waitLimit = 10000;
+            int tickLength = 10;
+            int ticks = 0;
+            Result result = Result.Waiting;
+            while (true) {
+                if (outgoingStreamsWaitingForConfirmation.TryGetValue(md5, out var callbackResult)) {
+                    if (callbackResult.result != Result.Waiting) {
+                        result = callbackResult.result;
                         break;
                     }
                 }
-            }
 
-            Invoke:
-            progressTracker.ProgressAction = ProgressAction.Finished;
-            callback?.Invoke(result);
+                ticks++;
+
+                if (ticks * tickLength > waitLimit) {
+                    outgoingStreamsWaitingForConfirmation.Remove(md5);
+                    result = Result.Failed;
+                    LogMessage($"Failed to confirm result of transfer (Timed out)", LogType.Error);
+                    break;
+                }
+
+                await Task.Delay(tickLength);
+            }
+            return result;
         }
         
-        static void InformTransferResult(string md5, Result result) {
-            if (outgoingStreamsWaitingForConfirmation.ContainsKey(md5)) {
-                outgoingStreamsWaitingForConfirmation[md5] = result;
+        public static void ReceiveFileChunk(FileChunk chunk) {
+            ReceiveStreamData(chunk.data, chunk.index, chunk.md5, chunk.identifier, chunk.fileSize, chunk.serialized, chunk.final);
+        }
+        public static void ReceiveFileChunk(NetworkConnection conn, FileChunk chunk) {
+            ReceiveStreamData(chunk.data, chunk.index, chunk.md5, chunk.identifier, chunk.fileSize, chunk.serialized, chunk.final);
+            if (incomingMemoryStreams.ContainsKey(chunk.md5)) {
+                incomingMemoryStreams[chunk.md5].connection_serverUseOnly = conn;
             }
         }
         
-
-        [Command]
-        static void Cmd_InformTransferResult(string md5, Result result) {
-            if (outgoingStreamsWaitingForConfirmation.ContainsKey(md5)) {
-                outgoingStreamsWaitingForConfirmation[md5] = result;
+        public static void ReceiveFileResult(FileResult result) {
+            if (outgoingStreamsWaitingForConfirmation.ContainsKey(result.md5)) {
+                outgoingStreamsWaitingForConfirmation[result.md5].result = (Result)result.result;
+            }
+        }
+        public static void ReceiveFileResult(NetworkConnection conn, FileResult result) {
+            if (outgoingStreamsWaitingForConfirmation.ContainsKey(result.md5)) {
+                outgoingStreamsWaitingForConfirmation[result.md5].result = (Result)result.result;
             }
         }
 
-        [TargetRpc]
-        static void Target_InformTransferResult(NetworkConnection target, string md5, Result result) {
-            if (outgoingStreamsWaitingForConfirmation.ContainsKey(md5)) {
-                outgoingStreamsWaitingForConfirmation[md5] = result;
-            }
-        }
-
-        [Command]
-        static void Cmd_SendStreamData(NetworkConnection sender, byte[] bytes, int index, string md5, string identifier, long streamSize, bool serialized, bool final) {
-            if (ReceiveStreamData(bytes, index, md5, identifier, streamSize, serialized, final)) {
-                Target_ReceiveFinalChunk(new NetworkConnectionToClient(sender.connectionId), md5);
-            }
-        }
-
-        [TargetRpc]
-        static void Target_SendStreamData(NetworkConnection target, byte[] bytes, int index, string md5, string identifier, long streamSize, bool serialized, bool final) {
-            if (ReceiveStreamData(bytes, index, md5, identifier, streamSize, serialized, final)) {
-                Cmd_ReceiveFinalChunk(target, md5);
-            }
-        }
-
-        static bool ReceiveStreamData(byte[] bytes, int index, string md5, string identifier, long streamSize, bool serialized, bool final) {
+        static void ReceiveStreamData(byte[] bytes, int index, string md5, string identifier, long streamSize, bool serialized, bool final) {
             LogMessage($"Received chunk: [{index}:{bytes?.Length}]", LogType.Verbose);
 
             // Receiving stream data
@@ -256,14 +229,17 @@ namespace Gameclaw {
 
             if (incomingMemoryStreams[md5].progressTracker.ProgressAction == ProgressAction.TimedOut) {
                 incomingMemoryStreams[md5].progressTracker.ProgressAction = ProgressAction.Finished;
-                LogMessage("An incoming file request timed out. It was more than 60 seconds since it received any data.", LogType.Error);
                 FileTransfer.OnFailedToRecieveFile?.Invoke(identifier);
-                return false;
+                return;
             }
 
             // cache finalId if it's final
             if (final) {
                 incomingMemoryStreams[md5].finalId = index;
+                if (bytes == null) {
+                    // If the last chunk is empty we can reduce the final index by 1
+                    incomingMemoryStreams[md5].finalId--;
+                }
                 LogMessage($"Received final chunk Id: {index}", LogType.Verbose);
             }
 
@@ -272,6 +248,7 @@ namespace Gameclaw {
                 if (index == incomingMemoryStreams[md5].lastChunkId + 1) {
                     LogMessage($"Adding chunk to stream: {index}", LogType.Verbose);
                     incomingMemoryStreams[md5].lastChunkId = index;
+                    incomingMemoryStreams[md5].millisecondsSinceLastChunk = 0;
                     incomingMemoryStreams[md5].stream.Write(bytes, 0, bytes.Length);
                     progress = incomingMemoryStreams[md5].stream.Length / (float)streamSize;
                 }
@@ -295,15 +272,18 @@ namespace Gameclaw {
 
             // check if this was the last chunk
             if (incomingMemoryStreams[md5].lastChunkId == incomingMemoryStreams[md5].finalId) {
-                return true;
+                incomingMemoryStreams[md5].progressTracker.Progress = 1f;
+                incomingMemoryStreams[md5].progressTracker.ProgressAction = ProgressAction.Deserializing;
+                ProcessFile(md5);
             }
-            return false;
         }
 
-        [Command]
-        static void Cmd_ReceiveFinalChunk(NetworkConnection target, string md5) {
+        public static async void ProcessFile(string md5) {
+            LogMessage($"Processing received file, size {incomingMemoryStreams[md5].stream.Length}", LogType.Log);
             // check if the stream was successful with the md5
-            string finalmd5 = GenerateMD5(incomingMemoryStreams[md5].stream);
+            incomingMemoryStreams[md5].stream.Seek(0, SeekOrigin.Begin);
+            string finalmd5 = await GenerateMD5(incomingMemoryStreams[md5].stream);
+            LogMessage($"Comparing MD5s:\n{md5}\n{finalmd5}", LogType.Log);
             if (finalmd5 == md5) {
                 // Succeeded
                 LogMessage("stream succeeded with matching MD5 hash", LogType.Log);
@@ -319,12 +299,14 @@ namespace Gameclaw {
                         object deserializedStream = formatter.Deserialize(incomingMemoryStreams[md5].stream);
                         incomingMemoryStreams[md5].stream?.Dispose();
                         FileTransfer.OnRecieveObject?.Invoke(deserializedStream, incomingMemoryStreams[md5].identifier);
-                        Target_InformTransferResult(target, md5, Result.Succeeded);
+                        
+                        InformSenderOfResult(md5, Result.Succeeded);
                     }
                     catch(Exception e) {
                         LogMessage($"Failed to deserialize data from stream. Caught exception: {e.Message}\nStacktrace: {e.StackTrace}", LogType.Error);
                         FileTransfer.OnFailedToRecieveFile?.Invoke(incomingMemoryStreams[md5].identifier);
-                        Target_InformTransferResult(target, md5, Result.Failed);
+                        
+                        InformSenderOfResult(md5, Result.Failed);
                         incomingMemoryStreams[md5].stream?.Dispose();
                     }
                 } 
@@ -334,12 +316,14 @@ namespace Gameclaw {
                     try {
                         incomingMemoryStreams[md5].stream.Seek(0, SeekOrigin.Begin);
                         FileTransfer.OnRecieveStream?.Invoke(incomingMemoryStreams[md5].stream, incomingMemoryStreams[md5].identifier);
-                        Target_InformTransferResult(target, md5, Result.Succeeded);
+                        
+                        InformSenderOfResult(md5, Result.Succeeded);
                     }
                     catch(Exception e) {
                         LogMessage($"Failed finalise data stream. Caught exception: {e.Message}\nStacktrace: {e.StackTrace}", LogType.Error);
                         FileTransfer.OnFailedToRecieveFile?.Invoke(incomingMemoryStreams[md5].identifier);
-                        Target_InformTransferResult(target, md5, Result.Failed);
+                        
+                        InformSenderOfResult(md5, Result.Failed);
                         incomingMemoryStreams[md5].stream?.Dispose();
                     }
                 }
@@ -348,58 +332,28 @@ namespace Gameclaw {
             else {
                 // Failed
                 LogMessage($"transfer failed due to mismatched MD5", LogType.Error);
-                Target_InformTransferResult(target, md5, Result.Failed);
+                
+                InformSenderOfResult(md5, Result.Failed);
                 incomingMemoryStreams[md5].progressTracker.ProgressAction = ProgressAction.Finished;
+            }
+            if (incomingMemoryStreams.ContainsKey(md5)) {
+                incomingMemoryStreams.Remove(md5);
             }
         }
 
-        [TargetRpc]
-        static void Target_ReceiveFinalChunk(NetworkConnection target, string md5) {
-            // check if the stream was successful with the md5
-            string finalmd5 = GenerateMD5(incomingMemoryStreams[md5].stream);
-            if (finalmd5 == md5) {
-                // Succeeded
-                LogMessage("stream succeeded with matching MD5 hash", LogType.Log);
-                
-                if (incomingMemoryStreams[md5].serialized) {
-                    incomingMemoryStreams[md5].progressTracker.ProgressAction = ProgressAction.Deserializing;
-
-                    BinaryFormatter formatter = GetBinaryFormatter();
-
-                    try {
-                        incomingMemoryStreams[md5].stream.Seek(0, SeekOrigin.Begin);
-                        object deserializedStream = formatter.Deserialize(incomingMemoryStreams[md5].stream);
-                        FileTransfer.OnRecieveObject?.Invoke(deserializedStream, incomingMemoryStreams[md5].identifier);
-                        Cmd_InformTransferResult(md5, Result.Succeeded);
-                    }
-                    catch(Exception e) {
-                        LogMessage($"[FileTransfer]: Failed to deserialize data from stream. Caught exception: {e.Message}\nStacktrace: {e.StackTrace}", LogType.Error);
-                        FileTransfer.OnFailedToRecieveFile?.Invoke(incomingMemoryStreams[md5].identifier);
-                        Cmd_InformTransferResult(md5, Result.Failed);
-                    }
-                }
-                // STREAM
-                else
-                {
-                    try {
-                        incomingMemoryStreams[md5].stream.Seek(0, SeekOrigin.Begin);
-                        FileTransfer.OnRecieveStream?.Invoke(incomingMemoryStreams[md5].stream, incomingMemoryStreams[md5].identifier);
-                        Cmd_InformTransferResult(md5, Result.Succeeded);
-                    }
-                    catch(Exception e) {
-                        LogMessage($"Failed finalise data stream. Caught exception: {e.Message}\nStacktrace: {e.StackTrace}", LogType.Error);
-                        FileTransfer.OnFailedToRecieveFile?.Invoke(incomingMemoryStreams[md5].identifier);
-                        Cmd_InformTransferResult(md5, Result.Failed);
-                        incomingMemoryStreams[md5].stream?.Dispose();
-                    }
-                }
-                incomingMemoryStreams[md5].progressTracker.ProgressAction = ProgressAction.Finished;
+        static void InformSenderOfResult(string md5, Result result) {
+            LogMessage($"Informing sender of result {result.ToString()}", LogType.Log);
+            if (!NetworkClient.localPlayer.isServer) {
+                NetworkClient.Send(new FileResult {
+                    result = (int)result,
+                    md5 = md5
+                });
             }
             else {
-                // Failed
-                LogMessage($"transfer failed due to mismatched MD5", LogType.Error);
-                Cmd_InformTransferResult(md5, Result.Failed);
-                incomingMemoryStreams[md5].progressTracker.ProgressAction = ProgressAction.Finished;
+                incomingMemoryStreams[md5].connection_serverUseOnly.Send(new FileResult {
+                    result = (int)result,
+                    md5 = md5
+                });
             }
         }
 #endregion // Internal
@@ -430,14 +384,14 @@ namespace Gameclaw {
         }
 
         //-----------------------------------[ Generate MD5 ]----------------------------------------//
-        static string GenerateMD5(Stream data) {
+        public static async Task<string> GenerateMD5(Stream data) {
             using MD5 md5 = MD5.Create();
-            byte[] hash = md5.ComputeHash(data);
+            byte[] hash = await Task.Run(() => md5.ComputeHash(data));
             return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
         }
     
         //---------------------------------[ Binary Formatter ]--------------------------------------//
-        static BinaryFormatter GetBinaryFormatter()
+        public static BinaryFormatter GetBinaryFormatter()
         {
             BinaryFormatter formatter = new BinaryFormatter();
 

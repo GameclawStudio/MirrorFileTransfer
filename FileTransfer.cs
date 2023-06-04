@@ -24,7 +24,8 @@ namespace Gameclaw {
         /// <remarks>The string is the identifier passed into the SendData method</remarks>
         public static Action<string> OnFailedToRecieveFile;
         /// <summary>
-        /// This will send the specified data from a client to the server. (This will use a [Command] type method)
+        /// This will send the specified data from a client to the server or a server to a client.
+        /// It cannot send from client to client.
         /// </summary>
         /// <param name="conn">The connection id of the client sending the data</param>
         /// <param name="data">the data you want to send. Must be serializable with the <see cref="BinaryFormatter"/></param>
@@ -38,15 +39,15 @@ namespace Gameclaw {
         /// Vector2, Vector2Int, Vector3, Vector3Int. You can look at the provided surrogates as
         /// examples if you'd like to include your own. They will also need to be added to the
         /// <see cref="GetBinaryFormatter"/> method at the bottom of this (FileTransfer.cs) script</remarks>
-        public static FileTransferProgress SendDataToServer(NetworkConnectionToClient conn, object data, string identifier, Action<Result> result) {
+        public static FileTransferProgress SendDataToConnection(NetworkConnection conn, object data, string identifier, Action<Result> result) {
             FileTransferProgress progressTracker = new FileTransferProgress();
-            FileTransferInternal.SendData(conn, progressTracker, data, false, identifier, result);
+            FileTransferInternal.SendData(conn, progressTracker, data, identifier, result);
             return progressTracker;
         }
         
         /// <summary>
-        /// This will send the specified data from a client to the server.
-        /// (This will use a [Command] type method)
+        /// This will send the specified data from a client to the server or a server to a client.
+        /// It cannot send from client to client.
         /// </summary>
         /// <param name="conn">The connection id of the client sending the data</param>
         /// <param name="data">the data you want to send. Can be any type derived from a Stream,
@@ -56,51 +57,17 @@ namespace Gameclaw {
         /// <param name="result">The callback to be invoked when the process is finished</param>
         /// <returns>A FileTransferProgress reference that can be used to check the progress and
         /// current action being performed <seealso cref="FileTransferProgress"/></returns>
-        public static FileTransferProgress SendDataToServer(NetworkConnectionToClient conn, Stream data, string identifier, Action<Result> result) {
+        public static FileTransferProgress SendDataToConnection(NetworkConnection conn, Stream data, string identifier, Action<Result> result) {
             FileTransferProgress progressTracker = new FileTransferProgress();
-            FileTransferInternal.SendData(conn, progressTracker, data, false, identifier, result);
+            FileTransferInternal.SendData(conn, progressTracker, data, identifier, result);
             return progressTracker;
         }
-        
-        /// <summary>
-        /// This will send the specified data from the server to a client.
-        /// (This will use a [TargetRpc] type method. Keep in mind this will only work if this method is run by the server)
-        /// </summary>
-        /// <param name="conn">The connection id of the client receiving the data</param>
-        /// <param name="data">the data you want to send. Must be serializable with the <see cref="BinaryFormatter"/></param>
-        /// <param name="identifier">this is a custom string that you will receive to inform the
-        /// client what type of file they received and how to process it (Entirely up to you)</param>
-        /// <param name="result">The callback to be invoked when the process is finished</param>
-        /// <returns>A FileTransferProgress reference that can be used to check the progress and
-        /// current action being performed <seealso cref="FileTransferProgress"/></returns>
-        /// <remarks>The <see cref="BinaryFormatter"/> cannot serialize/deserialize MonoBehaviour
-        /// members without a surrogate. Surrogates included with this FileTransfer are: Sprite,
-        /// Vector2, Vector2Int, Vector3, Vector3Int. You can look at the provided surrogates as
-        /// examples if you'd like to include your own. They will also need to be added to the
-        /// <see cref="GetBinaryFormatter"/> method at the bottom of this (FileTransfer.cs) script</remarks>
-        public static FileTransferProgress SendDataToClient(NetworkConnectionToClient conn, object data, string identifier, Action<Result> result) {
-            FileTransferProgress progressTracker = new FileTransferProgress();
-            FileTransferInternal.SendData(conn, progressTracker, data, true, identifier, result);
-            return progressTracker;
+
+        public static void BeginListening() {
+            FileTransferInternal.Setup();
         }
-        
-        /// <summary>
-        /// This will send the specified stream from the server to a client.
-        /// (This will use a [TargetRpc] type method. Keep in mind this will only work if this method is run by the server)
-        /// </summary>
-        /// <param name="conn">The connection id of the client receiving the data</param>
-        /// <param name="data">the data you want to send. Can be any type derived from a Stream,
-        /// such as FileStream or MemoryStream (So long as the stream can Seek)</param>
-        /// <param name="identifier">this is a custom string that you will receive to inform the
-        /// client what type of file they received and how to process it (Entirely up to you)</param>
-        /// /// <param name="result">The callback to be invoked when the process is finished</param>
-        /// <returns>A FileTransferProgress reference that can be used to check the progress and
-        /// current action being performed <seealso cref="FileTransferProgress"/></returns>
-        public static FileTransferProgress SendDataToClient(NetworkConnectionToClient conn, Stream data, string identifier, Action<Result> result) {
-            FileTransferProgress progressTracker = new FileTransferProgress();
-            FileTransferInternal.SendData(conn, progressTracker, data, true, identifier, result);
-            return progressTracker;
+        public static void StopListening() {
+            FileTransferInternal.Shutdown();
         }
-        
     }
 }

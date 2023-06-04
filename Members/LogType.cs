@@ -1,5 +1,5 @@
 namespace Gameclaw {
-    internal enum LogType {
+    public enum LogType {
         Verbose,
         Log,
         Warning,
